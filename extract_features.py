@@ -23,30 +23,9 @@ flags = tf.flags
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_bool("use_tpu", False, help="whether to use TPUs")
-flags.DEFINE_bool("use_bfloat16", False, help="whether to use bfloat16")
-flags.DEFINE_float("dropout", default=0.1,
-                   help="Dropout rate.")
-flags.DEFINE_float("dropatt", default=0.1,
-                   help="Attention dropout rate.")
-flags.DEFINE_enum("init", default="normal",
-                  enum_values=["normal", "uniform"],
-                  help="Initialization method.")
-flags.DEFINE_float("init_range", default=0.1,
-                   help="Initialization std when init is uniform.")
-flags.DEFINE_float("init_std", default=0.02,
-                   help="Initialization std when init is normal.")
-flags.DEFINE_integer("clamp_len", default=-1,
-                     help="Clamp length")
-flags.DEFINE_integer("mem_len", default=70,
-                     help="Number of steps to cache")
-flags.DEFINE_integer("reuse_len", 256,
-                     help="Number of token that can be reused as memory. "
-                          "Could be half of seq_len.")
-flags.DEFINE_bool("bi_data", default=True,
-                  help="Use bidirectional data streams, i.e., forward & backward.")
-flags.DEFINE_bool("same_length", default=False,
-                  help="Same length attention")
+flags.DEFINE_string("input_file", None, "")
+
+flags.DEFINE_string("output_file", None, "")
 
 
 def convert_to_unicode(text):
@@ -87,7 +66,7 @@ def read_examples(input_file):
                 text_a = m.group(1)
                 text_b = m.group(2)
             examples.append(
-                InputExample(guid=unique_id, text_a=text_a, text_b=text_b))
+                InputExample(guid=unique_id, text_a=text_a, text_b=text_b, label=0.0))
             unique_id += 1
     return examples
 
@@ -118,12 +97,6 @@ def model_fn_builder():
             seg_ids=seg_id,
             input_mask=inp_mask)
 
-        # Get a summary of the sequence using the last hidden state
-        summary = xlnet_model.get_pooled_out(summary_type="last")
-
-        # Get a sequence output
-        seq_out = xlnet_model.get_sequence_output()
-
         # Check model parameters
         num_params = sum([np.prod(v.shape) for v in tf.trainable_variables()])
         tf.logging.info('#params: {}'.format(num_params))
@@ -131,13 +104,25 @@ def model_fn_builder():
         # load pretrained models
         scaffold_fn = init_from_checkpoint(FLAGS)
 
-        predictions = {
-            'summary': summary,
-            'seq_out': seq_out
-        }
+        # Get a summary of the sequence using the last hidden state
+        summary = xlnet_model.get_pooled_out(FLAGS.summary_type, FLAGS.use_summ_proj)
 
-        output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-            mode=mode, predictions=predictions, scaffold_fn=scaffold_fn)
+        # Get a sequence output
+        seq_out = xlnet_model.get_sequence_output()
+
+        batch_size = FLAGS.predict_batch_size
+
+        predictions = {}
+        # for i in range(batch_size):
+        #     predictions['pooled_%d' % i] = summary[i]
+
+        predictions['pooled'] = summary
+        if FLAGS.use_tpu:
+            output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+                mode=mode, predictions=predictions, scaffold_fn=scaffold_fn)
+        else:
+            output_spec = tf.estimator.EstimatorSpec(
+                mode=mode, predictions=predictions)
         return output_spec
 
     return model_fn
@@ -146,11 +131,16 @@ def model_fn_builder():
 def main(_):
     tf.logging.set_verbosity(tf.logging.INFO)
 
-    spiece_model_file = 'models/xlnet_cased_L-24_H-1024_A-16/spiece.model'
+    if FLAGS.do_predict:
+        predict_dir = FLAGS.predict_dir
+        if not tf.gfile.Exists(predict_dir):
+            tf.gfile.MakeDirs(predict_dir)
+
+    spiece_model_file = FLAGS.spiece_model_file
     sp_model = spm.SentencePieceProcessor()
     sp_model.Load(spiece_model_file)
 
-    label_list = None
+    label_list = [0.0]
 
     model_fn = model_fn_builder()
 
@@ -180,7 +170,7 @@ def main(_):
     # support a per-instance weight, and these get a weight of 0.0).
     #
     # Modified in XL: We also adopt the same mechanism for GPUs.
-    while len(examples) % FLAGS.eval_batch_size != 0:
+    while len(examples) % FLAGS.predict_batch_size != 0:
         examples.append(PaddingInputExample())
 
     spm_basename = os.path.basename(FLAGS.spiece_model_file)
@@ -193,11 +183,12 @@ def main(_):
         text = preprocess_text(text, lower=FLAGS.uncased)
         return encode_ids(sp_model, text)
 
+    # create a tf_record from examples
     file_based_convert_examples_to_features(
         examples, label_list, FLAGS.max_seq_length, tokenize_fn,
         pred_file)
 
-    assert len(examples) % FLAGS.eval_batch_size == 0
+    assert len(examples) % FLAGS.predict_batch_size == 0
 
     pred_input_fn = file_based_input_fn_builder(
         input_file=pred_file,
@@ -206,15 +197,13 @@ def main(_):
         drop_remainder=True)
 
     with codecs.getwriter("utf-8")(tf.gfile.Open(FLAGS.output_file, "w")) as writer:
-        for pred_cnt, result in enumerate(estimator.predict(input_fn=pred_input_fn,
-                                                            yield_single_examples=True,
-                                                            checkpoint_path=FLAGS.predict_ckpt)):
-            if pred_cnt % 1000 == 0:
-                tf.logging.info("Predicting submission for example: {}".format(pred_cnt))
+        for example_cnt, result in enumerate(estimator.predict(input_fn=pred_input_fn,
+                                                               yield_single_examples=True,
+                                                               checkpoint_path=FLAGS.predict_ckpt)):
+            if example_cnt % 1000 == 0:
+                tf.logging.info("Predicting submission for example_cnt: {}".format(example_cnt))
             output_json = collections.OrderedDict()
-            output_json['linex_index'] = pred_cnt
-            summary_output = result['summary']
-            output_json['summary'] = [round(float(x), 6) for x in summary_output.flat]
+            output_json['pooled_%d' % example_cnt] = [round(float(x), 6) for x in result['pooled'].flat]
             writer.write(json.dumps(output_json) + "\n")
 
 
@@ -222,4 +211,8 @@ if __name__ == "__main__":
     flags.mark_flag_as_required("input_file")
     flags.mark_flag_as_required("init_checkpoint")
     flags.mark_flag_as_required("output_file")
+    flags.mark_flag_as_required("model_config_path")
+    flags.mark_flag_as_required("output_dir")
+    flags.mark_flag_as_required("model_dir")
+    flags.mark_flag_as_required("spiece_model_file")
     tf.app.run()
