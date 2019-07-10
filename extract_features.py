@@ -3,7 +3,6 @@ from __future__ import division
 from __future__ import print_function
 
 import json
-import os
 import re
 
 import numpy as np
@@ -16,16 +15,63 @@ import tensorflow as tf
 import xlnet
 from model_utils import init_from_checkpoint, configure_tpu
 from prepro_utils import preprocess_text, encode_ids
-from run_classifier import InputExample, PaddingInputExample
-from run_classifier import file_based_convert_examples_to_features, file_based_input_fn_builder
+from run_classifier import PaddingInputExample
+
+from data_utils import SEP_ID, CLS_ID
+
+SEG_ID_A = 0
+SEG_ID_B = 1
+SEG_ID_CLS = 2
+SEG_ID_SEP = 3
+SEG_ID_PAD = 4
 
 flags = tf.flags
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string("input_file", None, "")
+flags.DEFINE_string("input_file", help="Input file of sentences", default="")
 
-flags.DEFINE_string("output_file", None, "")
+flags.DEFINE_string("output_file", help="Output (JSON) file", default="")
+
+
+class InputExample(object):
+    """A single training/test example for simple sequence classification."""
+
+    def __init__(self, unique_id, text_a, text_b=None, label=None):
+        """Constructs a InputExample.
+        Args:
+          guid: Unique id for the example.
+          text_a: string. The untokenized text of the first sequence. For single
+            sequence tasks, only this sequence must be specified.
+          text_b: (Optional) string. The untokenized text of the second sequence.
+            Only must be specified for sequence pair tasks.
+          label: (Optional) string. The label of the example. This should be
+            specified for train and dev examples, but not for test examples.
+        """
+        self.unique_id = unique_id
+        self.text_a = text_a
+        self.text_b = text_b
+        self.label = label
+
+
+class InputFeatures(object):
+    """A single set of features of data."""
+
+    def __init__(self,
+                 unique_id,
+                 tokens,
+                 input_ids,
+                 input_mask,
+                 segment_ids,
+                 label_id,
+                 is_real_example=True):
+        self.unique_id = unique_id
+        self.tokens = tokens
+        self.input_ids = input_ids
+        self.input_mask = input_mask
+        self.segment_ids = segment_ids
+        self.label_id = label_id
+        self.is_real_example = is_real_example
 
 
 def convert_to_unicode(text):
@@ -65,8 +111,7 @@ def read_examples(input_file):
             else:
                 text_a = m.group(1)
                 text_b = m.group(2)
-            examples.append(
-                InputExample(guid=unique_id, text_a=text_a, text_b=text_b, label=0.0))
+            examples.append(InputExample(unique_id=unique_id, text_a=text_a, text_b=text_b, label=0.0))
             unique_id += 1
     return examples
 
@@ -77,15 +122,14 @@ def model_fn_builder():
     def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
         """The `model_fn` for TPUEstimator."""
 
-        # Training or Evaluation
-        is_training = (mode == tf.estimator.ModeKeys.TRAIN)
+        # Evaluation
+        is_training = False
 
+        unique_ids = features["unique_ids"]
         bsz_per_core = tf.shape(features["input_ids"])[0]
-
         inp = tf.transpose(features["input_ids"], [1, 0])
         seg_id = tf.transpose(features["segment_ids"], [1, 0])
         inp_mask = tf.transpose(features["input_mask"], [1, 0])
-        label = tf.reshape(features["label_ids"], [bsz_per_core])
 
         xlnet_config = xlnet.XLNetConfig(json_path=FLAGS.model_config_path)
         run_config = xlnet.create_run_config(is_training, True, FLAGS)
@@ -110,13 +154,8 @@ def model_fn_builder():
         # Get a sequence output
         seq_out = xlnet_model.get_sequence_output()
 
-        batch_size = FLAGS.predict_batch_size
+        predictions = {"unique_id": unique_ids, 'pooled': summary}
 
-        predictions = {}
-        # for i in range(batch_size):
-        #     predictions['pooled_%d' % i] = summary[i]
-
-        predictions['pooled'] = summary
         if FLAGS.use_tpu:
             output_spec = tf.contrib.tpu.TPUEstimatorSpec(
                 mode=mode, predictions=predictions, scaffold_fn=scaffold_fn)
@@ -126,6 +165,181 @@ def model_fn_builder():
         return output_spec
 
     return model_fn
+
+
+def input_fn_builder(features, seq_length):
+    """Creates an `input_fn` closure to be passed to TPUEstimator."""
+
+    all_unique_ids = []
+    all_input_ids = []
+    all_input_mask = []
+    all_segment_ids = []
+    all_label_ids = []
+    all_is_real_example = []
+
+    for feature in features:
+        all_unique_ids.append(feature.unique_id)
+        all_input_ids.append(feature.input_ids)
+        all_input_mask.append(feature.input_mask)
+        all_segment_ids.append(feature.segment_ids)
+        all_label_ids.append(feature.label_id)
+        all_is_real_example.append(feature.is_real_example)
+
+    def input_fn(params, input_context=None):
+        """The actual input function."""
+        if FLAGS.use_tpu:
+            batch_size = params["batch_size"]
+        else:
+            batch_size = FLAGS.predict_batch_size
+
+        num_examples = len(features)
+
+        # This is for demo purposes and does NOT scale to large data sets. We do
+        # not use Dataset.from_generator() because that uses tf.py_func which is
+        # not TPU compatible. The right way to load data is with TFRecordReader.
+        d = tf.data.Dataset.from_tensor_slices({
+            "unique_ids":
+                tf.constant(all_unique_ids, shape=[num_examples], dtype=tf.int32),
+            "input_ids":
+                tf.constant(
+                    all_input_ids, shape=[num_examples, seq_length],
+                    dtype=tf.int32),
+            "input_mask":
+                tf.constant(
+                    all_input_mask,
+                    shape=[num_examples, seq_length],
+                    dtype=tf.float32),
+            "segment_ids":
+                tf.constant(
+                    all_input_mask,
+                    shape=[num_examples, seq_length],
+                    dtype=tf.int32),
+            "label_ids":
+                tf.constant(
+                    all_label_ids,
+                    shape=[num_examples],
+                    dtype=tf.int32),
+            "is_real_example":
+                tf.constant(
+                    all_is_real_example,
+                    shape=[num_examples],
+                    dtype=tf.int32),
+        })
+
+        # Shard the dataset to difference devices
+        if input_context is not None:
+            tf.logging.info("Input pipeline id %d out of %d",
+                            input_context.input_pipeline_id, input_context.num_replicas_in_sync)
+            d = d.shard(input_context.num_input_pipelines,
+                        input_context.input_pipeline_id)
+
+        d = d.batch(batch_size=batch_size, drop_remainder=False)
+
+        return d
+
+    return input_fn
+
+
+def _truncate_seq_pair(tokens_a, tokens_b, max_length):
+    """Truncates a sequence pair in place to the maximum length."""
+
+    # This is a simple heuristic which will always truncate the longer sequence
+    # one token at a time. This makes more sense than truncating an equal percent
+    # of tokens from each, since if one sequence is very short then each token
+    # that's truncated likely contains more information than a longer sequence.
+    while True:
+        total_length = len(tokens_a) + len(tokens_b)
+        if total_length <= max_length:
+            break
+        if len(tokens_a) > len(tokens_b):
+            tokens_a.pop()
+        else:
+            tokens_b.pop()
+
+
+def convert_examples_to_features(examples, max_seq_length, tokenize_fn):
+    """Converts a single `InputExample` into a single `InputFeatures`."""
+
+    features = []
+    for ex_index, example in enumerate(examples):
+        if isinstance(example, PaddingInputExample):
+            features.append(InputFeatures(
+                unique_id=ex_index,
+                tokens=[''] * max_seq_length,
+                input_ids=[0] * max_seq_length,
+                input_mask=[1] * max_seq_length,
+                segment_ids=[0] * max_seq_length,
+                label_id=0,
+                is_real_example=False))
+            continue
+
+        tokens_a = tokenize_fn(example.text_a)
+        tokens_b = None
+        if example.text_b:
+            tokens_b = tokenize_fn(example.text_b)
+
+        if tokens_b:
+            # Modifies `tokens_a` and `tokens_b` in place so that the total
+            # length is less than the specified length.
+            # Account for two [SEP] & one [CLS] with "- 3"
+            _truncate_seq_pair(tokens_a, tokens_b, max_seq_length - 3)
+        else:
+            # Account for one [SEP] & one [CLS] with "- 2"
+            if len(tokens_a) > max_seq_length - 2:
+                tokens_a = tokens_a[:max_seq_length - 2]
+
+        tokens = []
+        segment_ids = []
+        for token in tokens_a:
+            tokens.append(token)
+            segment_ids.append(SEG_ID_A)
+        tokens.append(SEP_ID)
+        segment_ids.append(SEG_ID_A)
+
+        if tokens_b:
+            for token in tokens_b:
+                tokens.append(token)
+                segment_ids.append(SEG_ID_B)
+            tokens.append(SEP_ID)
+            segment_ids.append(SEG_ID_B)
+
+        tokens.append(CLS_ID)
+        segment_ids.append(SEG_ID_CLS)
+
+        input_ids = tokens
+
+        # The mask has 0 for real tokens and 1 for padding tokens. Only real
+        # tokens are attended to.
+        input_mask = [0] * len(input_ids)
+
+        # Zero-pad up to the sequence length.
+        if len(input_ids) < max_seq_length:
+            delta_len = max_seq_length - len(input_ids)
+            input_ids = [0] * delta_len + input_ids
+            input_mask = [1] * delta_len + input_mask
+            segment_ids = [SEG_ID_PAD] * delta_len + segment_ids
+
+        assert len(input_ids) == max_seq_length
+        assert len(input_mask) == max_seq_length
+        assert len(segment_ids) == max_seq_length
+
+        if ex_index < 5:
+            tf.logging.info("*** Example ***")
+            tf.logging.info("guid: %s" % ex_index)
+            tf.logging.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
+            tf.logging.info("input_mask: %s" % " ".join([str(x) for x in input_mask]))
+            tf.logging.info("segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
+            tf.logging.info("label: {} (id = {})".format(0.0, 0))
+
+        features.append(InputFeatures(
+            unique_id=ex_index,
+            tokens=tokens,
+            input_ids=input_ids,
+            input_mask=input_mask,
+            segment_ids=segment_ids,
+            label_id=0,
+            is_real_example=True))
+    return features
 
 
 def main(_):
@@ -139,8 +353,6 @@ def main(_):
     spiece_model_file = FLAGS.spiece_model_file
     sp_model = spm.SentencePieceProcessor()
     sp_model.Load(spiece_model_file)
-
-    label_list = [0.0]
 
     model_fn = model_fn_builder()
 
@@ -173,37 +385,39 @@ def main(_):
     while len(examples) % FLAGS.predict_batch_size != 0:
         examples.append(PaddingInputExample())
 
-    spm_basename = os.path.basename(FLAGS.spiece_model_file)
-
-    pred_file_base = "{}.len-{}.{}.predict.tf_record".format(
-        spm_basename, FLAGS.max_seq_length, FLAGS.eval_split)
-    pred_file = os.path.join(FLAGS.output_dir, pred_file_base)
-
     def tokenize_fn(text):
         text = preprocess_text(text, lower=FLAGS.uncased)
         return encode_ids(sp_model, text)
 
-    # create a tf_record from examples
-    file_based_convert_examples_to_features(
-        examples, label_list, FLAGS.max_seq_length, tokenize_fn,
-        pred_file)
+    features = convert_examples_to_features(
+        examples=examples, max_seq_length=FLAGS.max_seq_length, tokenize_fn=tokenize_fn)
+
+    unique_id_to_feature = {}
+    for feature in features:
+        unique_id_to_feature[feature.unique_id] = feature
 
     assert len(examples) % FLAGS.predict_batch_size == 0
 
-    pred_input_fn = file_based_input_fn_builder(
-        input_file=pred_file,
-        seq_length=FLAGS.max_seq_length,
-        is_training=False,
-        drop_remainder=True)
+    input_fn = input_fn_builder(
+        features=features, seq_length=FLAGS.max_seq_length)
 
     with codecs.getwriter("utf-8")(tf.gfile.Open(FLAGS.output_file, "w")) as writer:
-        for example_cnt, result in enumerate(estimator.predict(input_fn=pred_input_fn,
+        for example_cnt, result in enumerate(estimator.predict(input_fn=input_fn,
                                                                yield_single_examples=True,
                                                                checkpoint_path=FLAGS.predict_ckpt)):
             if example_cnt % 1000 == 0:
                 tf.logging.info("Predicting submission for example_cnt: {}".format(example_cnt))
+            unique_id = int(result["unique_id"])
+            feature = unique_id_to_feature[unique_id]
             output_json = collections.OrderedDict()
-            output_json['pooled_%d' % example_cnt] = [round(float(x), 6) for x in result['pooled'].flat]
+            output_json["linex_index"] = unique_id
+            output_json['pooled'] = [round(float(x), 6) for x in result['pooled'].flat]
+            all_features = []
+            for (i, token) in enumerate(feature.tokens):
+                features = collections.OrderedDict()
+                features["token"] = token
+                all_features.append(features)
+            output_json["features"] = all_features
             writer.write(json.dumps(output_json) + "\n")
 
 
