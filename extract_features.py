@@ -154,7 +154,8 @@ def model_fn_builder():
         # Get a sequence output
         seq_out = xlnet_model.get_sequence_output()
 
-        predictions = {"unique_id": unique_ids, 'pooled': summary}
+        predictions = {"unique_id": unique_ids,
+                       'pooled': summary}
 
         if FLAGS.use_tpu:
             output_spec = tf.contrib.tpu.TPUEstimatorSpec(
@@ -257,7 +258,7 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
             tokens_b.pop()
 
 
-def convert_examples_to_features(examples, max_seq_length, tokenize_fn):
+def convert_examples_to_features(examples, max_seq_length, tokenize_fn, sp_model):
     """Converts a single `InputExample` into a single `InputFeatures`."""
 
     features = []
@@ -273,10 +274,13 @@ def convert_examples_to_features(examples, max_seq_length, tokenize_fn):
                 is_real_example=False))
             continue
 
-        tokens_a = tokenize_fn(example.text_a)
+        tokens_a_str = tokenize_fn(example.text_a)
+        tokens_a = encode_ids(sp_model, tokens_a_str)
         tokens_b = None
+        tokens_b_str = None
         if example.text_b:
-            tokens_b = tokenize_fn(example.text_b)
+            tokens_b_str = tokenize_fn(example.text_b)
+            tokens_b = encode_ids(sp_model, tokens_b_str)
 
         if tokens_b:
             # Modifies `tokens_a` and `tokens_b` in place so that the total
@@ -289,21 +293,27 @@ def convert_examples_to_features(examples, max_seq_length, tokenize_fn):
                 tokens_a = tokens_a[:max_seq_length - 2]
 
         tokens = []
+        tokens_str = []
         segment_ids = []
-        for token in tokens_a:
+        for token, token_str in zip(tokens_a, tokens_a_str):
             tokens.append(token)
+            tokens_str.append(token_str)
             segment_ids.append(SEG_ID_A)
         tokens.append(SEP_ID)
+        tokens_str.append("<sep>")
         segment_ids.append(SEG_ID_A)
 
         if tokens_b:
-            for token in tokens_b:
+            for token, token_str in zip(tokens_b, tokens_b_str):
                 tokens.append(token)
+                tokens_str.append(token_str)
                 segment_ids.append(SEG_ID_B)
             tokens.append(SEP_ID)
+            tokens_str.append("<sep>")
             segment_ids.append(SEG_ID_B)
 
         tokens.append(CLS_ID)
+        tokens_str.append("<sep>")
         segment_ids.append(SEG_ID_CLS)
 
         input_ids = tokens
@@ -333,7 +343,7 @@ def convert_examples_to_features(examples, max_seq_length, tokenize_fn):
 
         features.append(InputFeatures(
             unique_id=ex_index,
-            tokens=tokens,
+            tokens=tokens_str,
             input_ids=input_ids,
             input_mask=input_mask,
             segment_ids=segment_ids,
@@ -386,11 +396,10 @@ def main(_):
         examples.append(PaddingInputExample())
 
     def tokenize_fn(text):
-        text = preprocess_text(text, lower=FLAGS.uncased)
-        return encode_ids(sp_model, text)
+        return preprocess_text(text, lower=FLAGS.uncased)
 
     features = convert_examples_to_features(
-        examples=examples, max_seq_length=FLAGS.max_seq_length, tokenize_fn=tokenize_fn)
+        examples=examples, max_seq_length=FLAGS.max_seq_length, tokenize_fn=tokenize_fn, sp_model=sp_model)
 
     unique_id_to_feature = {}
     for feature in features:
@@ -416,6 +425,9 @@ def main(_):
             for (i, token) in enumerate(feature.tokens):
                 features = collections.OrderedDict()
                 features["token"] = token
+                # features["values"] = [
+                #     round(float(x), 6) for x in layer_output[i:(i + 1)].flat
+                # ]
                 all_features.append(features)
             output_json["features"] = all_features
             writer.write(json.dumps(output_json) + "\n")
