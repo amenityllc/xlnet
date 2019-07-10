@@ -154,8 +154,11 @@ def model_fn_builder():
         # Get a sequence output
         seq_out = xlnet_model.get_sequence_output()
 
+        tokens = tf.transpose(seq_out, [1, 0, 2])
+
         predictions = {"unique_id": unique_ids,
-                       'pooled': summary}
+                       'pooled': summary,
+                       'tokens': tokens}
 
         if FLAGS.use_tpu:
             output_spec = tf.contrib.tpu.TPUEstimatorSpec(
@@ -425,9 +428,9 @@ def main(_):
             for (i, token) in enumerate(feature.tokens):
                 features = collections.OrderedDict()
                 features["token"] = token
-                # features["values"] = [
-                #     round(float(x), 6) for x in layer_output[i:(i + 1)].flat
-                # ]
+                features["values"] = [
+                    round(float(x), 6) for x in result['tokens'][i].flat
+                ]
                 all_features.append(features)
             output_json["features"] = all_features
             writer.write(json.dumps(output_json) + "\n")
