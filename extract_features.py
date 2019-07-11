@@ -7,14 +7,13 @@ import re
 
 import numpy as np
 import sentencepiece as spm
-import six
 import codecs
 import collections
 import tensorflow as tf
 
 import xlnet
 from model_utils import init_from_checkpoint, configure_tpu
-from prepro_utils import preprocess_text, encode_ids
+from prepro_utils import preprocess_text, encode_pieces
 from run_classifier import PaddingInputExample
 
 from data_utils import SEP_ID, CLS_ID
@@ -74,24 +73,10 @@ class InputFeatures(object):
         self.is_real_example = is_real_example
 
 
-def convert_to_unicode(text):
-    """Converts `text` to Unicode (if it's not already), assuming utf-8 input."""
-    if six.PY3:
-        if isinstance(text, str):
-            return text
-        elif isinstance(text, bytes):
-            return text.decode("utf-8", "ignore")
-        else:
-            raise ValueError("Unsupported string type: %s" % (type(text)))
-    elif six.PY2:
-        if isinstance(text, str):
-            return text.decode("utf-8", "ignore")
-        elif isinstance(text, unicode):
-            return text
-        else:
-            raise ValueError("Unsupported string type: %s" % (type(text)))
-    else:
-        raise ValueError("Not running on Python2 or Python 3?")
+def _encode_ids(sp_model, text, sample=False):
+    pieces = encode_pieces(sp_model, text, return_unicode=False, sample=sample)
+    ids = [sp_model.PieceToId(piece) for piece in pieces]
+    return pieces, ids
 
 
 def read_examples(input_file):
@@ -100,7 +85,7 @@ def read_examples(input_file):
     unique_id = 0
     with tf.gfile.GFile(input_file, "r") as reader:
         while True:
-            line = convert_to_unicode(reader.readline())
+            line = reader.readline()
             if not line:
                 break
             line = line.strip()
@@ -157,7 +142,7 @@ def model_fn_builder():
         tokens = tf.transpose(seq_out, [1, 0, 2])
 
         predictions = {"unique_id": unique_ids,
-                       'pooled': summary,
+                       'pooled_%s' % FLAGS.summary_type: summary,
                        'tokens': tokens}
 
         if FLAGS.use_tpu:
@@ -261,7 +246,7 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
             tokens_b.pop()
 
 
-def convert_examples_to_features(examples, max_seq_length, tokenize_fn, sp_model):
+def convert_examples_to_features(examples, max_seq_length, sp_model, uncased):
     """Converts a single `InputExample` into a single `InputFeatures`."""
 
     features = []
@@ -277,13 +262,15 @@ def convert_examples_to_features(examples, max_seq_length, tokenize_fn, sp_model
                 is_real_example=False))
             continue
 
-        tokens_a_str = tokenize_fn(example.text_a)
-        tokens_a = encode_ids(sp_model, tokens_a_str)
+        tokens_a_preprocessed = preprocess_text(example.text_a, lower=uncased)
+        tokens_a_unicode, tokens_a = _encode_ids(sp_model, tokens_a_preprocessed)
+        tokens_a_str = [token.encode("ascii", "ignore").decode('utf-8', 'ignore') for token in tokens_a_unicode]
         tokens_b = None
         tokens_b_str = None
         if example.text_b:
-            tokens_b_str = tokenize_fn(example.text_b)
-            tokens_b = encode_ids(sp_model, tokens_b_str)
+            tokens_b_preprocessed = preprocess_text(example.text_b, lower=uncased)
+            tokens_b_unicode, tokens_b = _encode_ids(sp_model, tokens_b_preprocessed)
+            tokens_b_str = [token.encode("ascii", "ignore").decode('utf-8', 'ignore') for token in tokens_b_unicode]
 
         if tokens_b:
             # Modifies `tokens_a` and `tokens_b` in place so that the total
@@ -398,11 +385,8 @@ def main(_):
     while len(examples) % FLAGS.predict_batch_size != 0:
         examples.append(PaddingInputExample())
 
-    def tokenize_fn(text):
-        return preprocess_text(text, lower=FLAGS.uncased)
-
     features = convert_examples_to_features(
-        examples=examples, max_seq_length=FLAGS.max_seq_length, tokenize_fn=tokenize_fn, sp_model=sp_model)
+        examples=examples, max_seq_length=FLAGS.max_seq_length, sp_model=sp_model, uncased=FLAGS.uncased)
 
     unique_id_to_feature = {}
     for feature in features:
@@ -423,7 +407,8 @@ def main(_):
             feature = unique_id_to_feature[unique_id]
             output_json = collections.OrderedDict()
             output_json["linex_index"] = unique_id
-            output_json['pooled'] = [round(float(x), 6) for x in result['pooled'].flat]
+            output_json['pooled_%s' % FLAGS.summary_type] = [round(float(x), 6)
+                                                             for x in result['pooled_%s' % FLAGS.summary_type].flat]
             all_features = []
             for (i, token) in enumerate(feature.tokens):
                 features = collections.OrderedDict()
