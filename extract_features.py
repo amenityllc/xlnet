@@ -342,6 +342,10 @@ def convert_examples_to_features(examples, max_seq_length, sp_model, uncased):
     return features
 
 
+def _round_vector(values, points):
+    return [round(float(x), points) for x in values]
+
+
 def main(_):
     tf.logging.set_verbosity(tf.logging.INFO)
 
@@ -374,6 +378,7 @@ def main(_):
             config=run_config)
 
     examples = read_examples(FLAGS.input_file)
+    original_examples_length = len(examples)
 
     # TPU requires a fixed batch size for all batches, therefore the number
     # of examples must be a multiple of the batch size, or else examples
@@ -403,22 +408,24 @@ def main(_):
                                                                checkpoint_path=FLAGS.predict_ckpt)):
             if example_cnt % 1000 == 0:
                 tf.logging.info("Predicting submission for example_cnt: {}".format(example_cnt))
-            unique_id = int(result["unique_id"])
-            feature = unique_id_to_feature[unique_id]
-            output_json = collections.OrderedDict()
-            output_json["linex_index"] = unique_id
-            output_json['pooled_%s' % FLAGS.summary_type] = [round(float(x), 6)
-                                                             for x in result['pooled_%s' % FLAGS.summary_type].flat]
-            all_features = []
-            for (i, token) in enumerate(feature.tokens):
-                features = collections.OrderedDict()
-                features["token"] = token
-                features["values"] = [
-                    round(float(x), 6) for x in result['tokens'][i].flat
-                ]
-                all_features.append(features)
-            output_json["features"] = all_features
-            writer.write(json.dumps(output_json) + "\n")
+
+            # output only real examples, and not padded examples
+            if example_cnt < original_examples_length:
+                unique_id = int(result["unique_id"])
+                feature = unique_id_to_feature[unique_id]
+                output_json = collections.OrderedDict()
+                output_json["linex_index"] = unique_id
+                output_json['pooled_%s' % FLAGS.summary_type] = _round_vector(
+                    result['pooled_%s' % FLAGS.summary_type].flat, 6
+                )
+                all_features = []
+                for (i, token) in enumerate(feature.tokens):
+                    features = collections.OrderedDict()
+                    features["token"] = token
+                    features["values"] = _round_vector(result['tokens'][i].flat, 6)
+                    all_features.append(features)
+                output_json["features"] = all_features
+                writer.write(json.dumps(output_json) + "\n")
 
 
 if __name__ == "__main__":
